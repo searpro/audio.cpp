@@ -1,0 +1,115 @@
+name: Release build (Linux + macOS)
+
+# Manually-triggered release build, separate from the existing CI checks
+# (linux-build.yml, mac-build.yml, ...), which build Debug and don't publish
+# anything — mac-build.yml explicitly builds with Metal OFF. This workflow
+# does a real RelWithDebInfo build via the project's own build scripts
+# (scripts/build_linux.sh, scripts/build_metal.sh), with:
+#   --native-cpu OFF     portable across different host CPUs, not just the
+#                         GitHub runner's exact one (a native-tuned binary
+#                         can SIGILL on other hardware)
+#   --deployment-build    embeds model_specs so the binary runs standalone,
+#                         without the source checkout sitting next to it
+# and publishes both as a GitHub Release in this repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to publish this build under"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-cpu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+      - name: Build (CPU backend, portable, deployment build)
+        run: |
+          set -euo pipefail
+          bash scripts/build_linux.sh --backend cpu --native-cpu OFF --deployment-build \
+            --target audiocpp_server --target audiocpp_cli -j "$(nproc)"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          DIR=audiocpp-server-linux-x86_64-cpu
+          mkdir -p "$DIR"
+          cp build/linux-cpu-release/bin/audiocpp_server build/linux-cpu-release/bin/audiocpp_cli "$DIR"/
+          strip "$DIR"/audiocpp_server "$DIR"/audiocpp_cli
+          cp LICENSE "$DIR"/
+          {
+            echo "Built from $GITHUB_REPOSITORY@$GITHUB_SHA"
+            echo "Backend: CPU (portable — native-cpu off), deployment build (standalone model_specs)"
+          } > "$DIR"/BUILD_INFO.txt
+          zip -r "$DIR.zip" "$DIR"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audiocpp-server-linux-x86_64-cpu
+          path: audiocpp-server-linux-x86_64-cpu.zip
+
+  build-macos-metal:
+    runs-on: macos-14 # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: brew install cmake ninja
+
+      - name: Build (Metal backend, portable, deployment build)
+        run: |
+          set -euo pipefail
+          bash scripts/build_metal.sh --native-cpu OFF --deployment-build \
+            --target audiocpp_server --target audiocpp_cli -j "$(sysctl -n hw.logicalcpu)"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          BUILD_DIR="$(find build -maxdepth 1 -name 'macos-metal-*' | head -1)"
+          DIR=audiocpp-server-macos-arm64-metal
+          mkdir -p "$DIR"
+          cp "$BUILD_DIR"/bin/audiocpp_server "$BUILD_DIR"/bin/audiocpp_cli "$DIR"/
+          strip "$DIR"/audiocpp_server "$DIR"/audiocpp_cli
+          cp LICENSE "$DIR"/
+          {
+            echo "Built from $GITHUB_REPOSITORY@$GITHUB_SHA"
+            echo "Backend: Metal (portable — native-cpu off), deployment build (standalone model_specs)"
+          } > "$DIR"/BUILD_INFO.txt
+          zip -r "$DIR.zip" "$DIR"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audiocpp-server-macos-arm64-metal
+          path: audiocpp-server-macos-arm64-metal.zip
+
+  publish-release:
+    needs: [build-linux-cpu, build-macos-metal]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_tag }}
+          body: |
+            Prebuilt audiocpp_server / audiocpp_cli for Linux (CPU) and macOS
+            (Metal, Apple Silicon). See BUILD_INFO.txt in each archive for
+            the exact source commit and build flags.
+          files: dist/*.zip
+          generate_release_notes: false
