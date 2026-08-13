@@ -5,12 +5,18 @@ name: Release build (Linux + macOS)
 # anything — mac-build.yml explicitly builds with Metal OFF. This workflow
 # does a real RelWithDebInfo build via the project's own build scripts
 # (scripts/build_linux.sh, scripts/build_metal.sh), with:
-#   --native-cpu OFF     portable across different host CPUs, not just the
-#                         GitHub runner's exact one (a native-tuned binary
-#                         can SIGILL on other hardware)
+#   --native-cpu OFF     portable across different host CPUs/GPU archs, not
+#                         just the GitHub runner's exact one (a native-tuned
+#                         binary can SIGILL on other hardware, and for CUDA
+#                         this also selects ggml's broad multi-architecture
+#                         default instead of "native", which needs a GPU
+#                         present at build time)
 #   --deployment-build    embeds model_specs so the binary runs standalone,
 #                         without the source checkout sitting next to it
-# and publishes both as a GitHub Release in this repo.
+# and publishes all three as a GitHub Release in this repo. The CUDA build
+# additionally bundles the CUDA Toolkit's runtime shared libraries next to
+# the binaries (with RPATH=$ORIGIN) so end users need only an NVIDIA driver,
+# not the CUDA Toolkit itself.
 
 on:
   workflow_dispatch:
@@ -58,6 +64,73 @@ jobs:
           name: audiocpp-server-linux-x86_64-cpu
           path: audiocpp-server-linux-x86_64-cpu.zip
 
+  build-linux-cuda:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build patchelf wget
+
+      - name: Install CUDA Toolkit
+        run: |
+          set -euo pipefail
+          CUDA_KEYRING_DEB=cuda-keyring_1.1-1_all.deb
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/${CUDA_KEYRING_DEB}"
+          sudo dpkg -i "${CUDA_KEYRING_DEB}"
+          rm -f "${CUDA_KEYRING_DEB}"
+          sudo apt-get update
+          # Toolkit only (no driver/kernel module) -- matches the version pinned
+          # in .devops/cuda.Dockerfile's cuda12 tag.
+          sudo apt-get install -y cuda-toolkit-12-9
+          echo "/usr/local/cuda-12.9/bin" >> "$GITHUB_PATH"
+          {
+            echo "CUDACXX=/usr/local/cuda-12.9/bin/nvcc"
+            echo "LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64"
+          } >> "$GITHUB_ENV"
+
+      - name: Build (CUDA backend, portable multi-arch, deployment build)
+        run: |
+          set -euo pipefail
+          bash scripts/build_linux.sh --backend cuda --native-cpu OFF --deployment-build \
+            --target audiocpp_server --target audiocpp_cli -j "$(nproc)"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          DIR=audiocpp-server-linux-x86_64-cuda
+          mkdir -p "$DIR"
+          cp build/linux-cuda-release/bin/audiocpp_server build/linux-cuda-release/bin/audiocpp_cli "$DIR"/
+          strip "$DIR"/audiocpp_server "$DIR"/audiocpp_cli
+
+          # Bundle the CUDA runtime shared libraries the binaries link against so
+          # end users don't need the CUDA Toolkit installed -- only an NVIDIA
+          # driver new enough for CUDA 12.9 -- then point each binary's RPATH at
+          # its own directory so the bundled copies are what actually loads.
+          for bin in "$DIR"/audiocpp_server "$DIR"/audiocpp_cli; do
+            for lib in $(ldd "$bin" | awk '/libcudart|libcublas|libcufft|libnvrtc/ {print $3}'); do
+              [ -f "$lib" ] && cp -n "$lib" "$DIR"/
+            done
+            patchelf --set-rpath '$ORIGIN' "$bin"
+          done
+
+          cp LICENSE "$DIR"/
+          {
+            echo "Built from $GITHUB_REPOSITORY@$GITHUB_SHA"
+            echo "Backend: CUDA (portable multi-architecture build, native-cpu off), deployment build (standalone model_specs)"
+            echo "Bundled CUDA runtime libraries (no CUDA Toolkit install required):"
+            ls "$DIR"/*.so* 2>/dev/null | xargs -n1 basename | sed 's/^/  /'
+            echo "Requires an NVIDIA Linux driver supporting CUDA 12.9 or newer, and a GPU covered by one of the built architectures (Maxwell through Blackwell)."
+          } > "$DIR"/BUILD_INFO.txt
+          zip -r "$DIR.zip" "$DIR"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audiocpp-server-linux-x86_64-cuda
+          path: audiocpp-server-linux-x86_64-cuda.zip
+
   build-macos-metal:
     runs-on: macos-14 # Apple Silicon (arm64)
     steps:
@@ -95,7 +168,7 @@ jobs:
           path: audiocpp-server-macos-arm64-metal.zip
 
   publish-release:
-    needs: [build-linux-cpu, build-macos-metal]
+    needs: [build-linux-cpu, build-linux-cuda, build-macos-metal]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
@@ -108,8 +181,9 @@ jobs:
           tag_name: ${{ inputs.release_tag }}
           name: ${{ inputs.release_tag }}
           body: |
-            Prebuilt audiocpp_server / audiocpp_cli for Linux (CPU) and macOS
-            (Metal, Apple Silicon). See BUILD_INFO.txt in each archive for
-            the exact source commit and build flags.
+            Prebuilt audiocpp_server / audiocpp_cli for Linux (CPU), Linux
+            (CUDA, bundled runtime libraries) and macOS (Metal, Apple
+            Silicon). See BUILD_INFO.txt in each archive for the exact
+            source commit and build flags.
           files: dist/*.zip
           generate_release_notes: false
